@@ -3,6 +3,15 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# VSCode configuration
+.vscode
+
+# Blender build ZIP file
+dist/*.zip
+
+# Bundled wheels for Blender build
+wheels/*.whl
+
 # C extensions
 *.so
 
@@ -10,7 +19,6 @@ __pycache__/
 .Python
 build/
 develop-eggs/
-dist/
 downloads/
 eggs/
 .eggs/
@@ -19,7 +27,6 @@ lib64/
 parts/
 sdist/
 var/
-wheels/
 share/python-wheels/
 *.egg-info/
 .installed.cfg

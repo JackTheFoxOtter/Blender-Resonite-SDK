@@ -21,11 +21,8 @@ license = [
 ]
 
 wheels = [
-    "./wheels/llvmlite-0.47.0-cp313-cp313-win_amd64.whl",
-    "./wheels/numba-0.65.1-cp313-cp313-win_amd64.whl",
-    "./wheels/quaternionic-1.0.17-py3-none-any.whl",
-    "./wheels/resonitelink_py-0.1.0b97-py3-none-any.whl",
-    "./wheels/scipy-1.17.1-cp313-cp313-win_amd64.whl",
+    "./wheels/numpy-2.4.6-cp313-cp313-win_amd64.whl",
+    "./wheels/resonitelink_py-0.1.0b98-py3-none-any.whl",
     "./wheels/websockets-16.0-cp313-cp313-win_amd64.whl",
 ]
 

@@ -292,15 +292,13 @@ async def _import_armature_hierarchy(client : ResoniteLinkClient, root_slot : Un
         
         space_correction : Matrix = props.coordinate_conversion_matrix.transposed() # Transposed because Blender's UI mixes up rows / columns
         space_correction_2 : Matrix = props.coordinate_conversion_matrix_2.transposed() # Transposed because Blender's UI mixes up rows / columns
-        # space_correction = Matrix(( # TODO: To constant somewhere.
-        #     (-1.0, 0.0, 0.0, 0.0), 
-        #     (0.0, 0.0, 1.0, 0.0), 
-        #     (0.0, -1.0, 0.0, 0.0),
-        #     (0.0, 0.0, 0.0, 1.0)
-        # ))
-
-        # print(space_correction)
-        # print(space_correction @ space_correction_2)
+        
+        inv_x = Matrix(( # TODO: To constant somewhere.
+            (-1.0, 0.0,  0.0, 0.0), 
+            (0.0,  1.0,  0.0, 0.0), 
+            (0.0,  0.0,  1.0, 0.0),
+            (0.0,  0.0,  0.0, 1.0)
+        ))
         
         mat : Matrix
         if not bone.parent:
@@ -309,7 +307,7 @@ async def _import_armature_hierarchy(client : ResoniteLinkClient, root_slot : Un
 
         else:
             # Not the root bone
-            mat = bone.parent.matrix_local.inverted() @ bone.matrix_local
+            mat = inv_x @ bone.parent.matrix_local.inverted() @ bone.matrix_local @ inv_x.inverted()
         
         position, rotation, scale = mat.decompose()
         bone_slot = await client.add_slot(
@@ -319,22 +317,18 @@ async def _import_armature_hierarchy(client : ResoniteLinkClient, root_slot : Un
             rotation=_quaternion_to_floatQ(rotation),
             scale=_vector_to_float3(scale),
         )
-        
-        if not bone.parent:
-            # Root bone
-            print(f"Result Pos: {_vector_to_float3(position)}")
-            print(f"Result Rot: {_quaternion_to_floatQ(rotation)}")
-            print(f"Result Scale: {_vector_to_float3(scale)}")
 
         bone_info = BoneInfo(
-            bone=Bone(name=bone.name, bind_pose=_matrix_to_float4x4(space_correction @ bone.matrix_local)),
+            bone=Bone(
+                name=bone.name, 
+                bind_pose=_matrix_to_float4x4(space_correction_2.inverted() @ space_correction @ root_bone.matrix_local.inverted() @ space_correction.inverted())
+            ),
             slot=bone_slot
         )
         bone_infos.append(bone_info)
 
         for child_bone in bone.children:
             await _build_armature_recursive(bone_slot, child_bone)
-
     
     await _build_armature_recursive(root_slot, root_bone)
 
@@ -393,7 +387,7 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
 
                     # Import armature as slot hierarchy.
                     self._bone_infos = await _import_armature_hierarchy(client, armature_root_slot, self._armature)
-                    self._bone_infos = None # TESTING: Don't submit bones, just armature.
+                    # self._bone_infos = None # TESTING: Don't submit bones, just armature.
                 
                 if self._mesh:
                     # Create mesh root slot

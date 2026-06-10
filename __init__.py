@@ -195,8 +195,8 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
         msg_import_mesh._uvs = [ uv_coords.tobytes() ]
     
     # Convert shape keys
-    msg_import_mesh.blendshapes = []
     if mesh.shape_keys:
+        msg_import_mesh.blendshapes = []
         for shape_key_name, shape_key in mesh.shape_keys.key_blocks.items():
             if shape_key.relative_key == shape_key:
                 # Skip basis key
@@ -217,12 +217,33 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
                 frames=[ blendshape_frame ]
             ))
     
-    # Convert bones & armature
+    # Convert bones (armature) & bone weights
     if bone_infos:
+        bone_weight_count = 4 # TODO: Expose as setting # Max amount of bones that can influence a single vertex. Max Resonite supports is 4
+        
+        # Blender stores bone influences per vertex as links to vertex groups associated with a weight value.
+        # Unfortunately, there doesn't seem to be a faster way to access that information.
+        vertex_influences = np.empty(vertex_count * bone_weight_count, dtype=[("group", np.int32), ("weight", np.float32)])
+        for vert_index, vert in enumerate(mesh.vertices):
+            group_index : int = 0
+            for group_index, group_element in enumerate(sorted(vert.groups, key=lambda g: g.weight, reverse=True)):
+                if group_index == bone_weight_count:
+                    # Vertex affected by more than bone_weight_count bones, discard remaining. (Sorted by most influencal bones.)
+                    break
+                
+                vertex_influences[vert_index * bone_weight_count + group_index][0] = group_element.group
+                vertex_influences[vert_index * bone_weight_count + group_index][1] = group_element.weight
+                
+            while group_index < bone_weight_count - 1:
+                # Vertex affected by less than bone_weight_count bones, pad remaining.
+                group_index += 1
+                vertex_influences[vert_index * bone_weight_count + group_index][0] = -1
+                vertex_influences[vert_index * bone_weight_count + group_index][1] = 0.0
+        
+        loop_influences = vertex_influences.reshape(-1, bone_weight_count)[loop_vertex_mapping]
         msg_import_mesh.bones = [ bone_info.bone for bone_info in bone_infos ]
-        bone_weights = np.tile(np.array([0.0, 1.0], dtype=np.float32), loop_count) # TODO: Properly implement this. Right now this is just a hack to set weight for hips bone to 1.0 for each vertex. 
-        msg_import_mesh.bone_weight_count = 1
-        msg_import_mesh._bone_weights = bone_weights.tobytes()
+        msg_import_mesh.bone_weight_count = bone_weight_count
+        msg_import_mesh._bone_weights = loop_influences.ravel().tobytes()
 
     # Convert triangles
     triangle_indices = np.empty(triangle_count*3, dtype=np.int32)
@@ -321,7 +342,7 @@ async def _import_armature_hierarchy(client : ResoniteLinkClient, root_slot : Un
         bone_info = BoneInfo(
             bone=Bone(
                 name=bone.name, 
-                bind_pose=_matrix_to_float4x4(space_correction_2.inverted() @ space_correction @ root_bone.matrix_local.inverted() @ space_correction.inverted())
+                bind_pose=_matrix_to_float4x4(space_correction_2.inverted() @ space_correction @ bone.matrix_local.inverted() @ space_correction.inverted())
             ),
             slot=bone_slot
         )
@@ -341,6 +362,7 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
     bl_description = "Sends the active object to Resonite."
 
     _object : bpy.types.Object
+    _object_name : str
     _armature : Optional[bpy.types.Armature]
     _bone_infos : Optional[List[BoneInfo]]
     _mesh : Optional[bpy.types.Mesh]
@@ -352,11 +374,13 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
             return
 
         self._object = context.active_object
+        self._object_name = self._object.name
         
         armature_obj = context.active_object.find_armature()
         if armature_obj:
             # Object has armature
             self._armature = armature_obj.data # type: ignore
+            self._object_name = armature_obj.name # Set name of object to name of armature object
         
         if context.active_object.data and type(context.active_object.data) == bpy.types.Mesh:
             # Object has mesh
@@ -373,7 +397,7 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
         async def _on_client_started(client : ResoniteLinkClient):
             try:
                 # Create slot to attach mesh to.
-                object_root_slot = await client.add_slot(name=self._object.name)
+                object_root_slot = await client.add_slot(name=self._object_name)
 
                 # Adds Grabbable component.
                 await object_root_slot.add_component("[FrooxEngine]FrooxEngine.Grabbable")
@@ -383,15 +407,20 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
                 
                 if self._armature:
                     # Create armature root slot.
-                    armature_root_slot = await client.add_slot(name=self._armature.name, parent=object_root_slot)
+                    armature_root_slot = await client.add_slot(name="Armature", parent=object_root_slot)
 
                     # Import armature as slot hierarchy.
                     self._bone_infos = await _import_armature_hierarchy(client, armature_root_slot, self._armature)
-                    # self._bone_infos = None # TESTING: Don't submit bones, just armature.
+
+                    # Set up rig component on root with bone references
+                    await object_root_slot.add_component(
+                        "[FrooxEngine]FrooxEngine.Rig",
+                        Bones=SyncList(*[ Reference(target_type="[FrooxEngine]FrooxEngine.Slot", target_id=bone_info.slot.id) for bone_info in self._bone_infos ]) if self._bone_infos else SyncList()
+                    )
                 
                 if self._mesh:
                     # Create mesh root slot
-                    mesh_root_slot = await client.add_slot(name=self._mesh.name, parent=object_root_slot)
+                    mesh_root_slot = await client.add_slot(name=self._object.name, parent=object_root_slot)
 
                     # Import mesh data
                     msg_import_mesh = _create_mesh_import_message(self._mesh, self._bone_infos)

@@ -148,6 +148,9 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
     loop_count = len(mesh.loops)
     triangle_count = len(mesh.loop_triangles)
     
+    # TODO: Right now each loop vertex is imported as a separate vertex. This results in doubles in the final mesh!
+    #       What needs to happen is that we put all required vertex data all loops into one big array, and then call np.unique() to remove all doubles.
+
     # Mapping to get the vertex index for each loop index
     loop_vertex_mapping = np.empty(loop_count, dtype=np.int32)
     mesh.loops.foreach_get('vertex_index', loop_vertex_mapping)
@@ -246,13 +249,23 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
         msg_import_mesh._bone_weights = loop_influences.ravel().tobytes()
 
     # Convert triangles
+    msg_import_mesh.submeshes = []
     triangle_indices = np.empty(triangle_count*3, dtype=np.int32)
     mesh.loop_triangles.foreach_get('loops', triangle_indices)
     _reverse_column_order(triangle_indices) # Reverse winding
-    triangle_submesh = TriangleSubmeshRawData()
-    triangle_submesh.triangle_count = triangle_count
-    triangle_submesh._indices = triangle_indices.tobytes()
-    msg_import_mesh.submeshes = [ triangle_submesh ]
+    material_indices = np.empty(triangle_count, dtype=np.int32)
+    mesh.loop_triangles.foreach_get('material_index', material_indices)
+    triangle_and_material_indices = np.concatenate((triangle_indices.reshape(-1, 3), material_indices.reshape(-1, 1)), axis=1)
+    
+    # Split submeshes by material index
+    material_count = np.max(material_indices) + 1
+    for material_index in range(material_count):
+        submesh_mask = triangle_and_material_indices[:, 3] == material_index # Boolean mask for material index
+        submesh_triangle_indices =  triangle_and_material_indices[submesh_mask, :3] # Don't include material index column
+        triangle_submesh = TriangleSubmeshRawData()
+        triangle_submesh.triangle_count = len(submesh_triangle_indices)
+        triangle_submesh._indices = submesh_triangle_indices.ravel().tobytes()
+        msg_import_mesh.submeshes.append(triangle_submesh)
     
     return msg_import_mesh
 

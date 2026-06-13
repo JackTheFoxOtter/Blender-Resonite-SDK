@@ -141,8 +141,14 @@ def _create_mesh_import_message(
 
     Note
     ----
-    In Blender, faces are defined through loops, the same vertex can be part of multiple loops.
-    To ensure we get all the correct face data (shading, UVs etc.), we need to import each loop as a separate vertex into Resonite.
+    In Blender, polygons are defined through loops of vertices, the same vertex can be part of multiple loops.
+    First, this code collects the relevant vertex data for every loop of the mesh. This data includes duplicate entries.
+    Then all of that loop data is put into one big 2d array, before duplicates are removed from it.
+    This way every unique loop point (postion, normal, tangent, color, UV coordinates) maps to a unique vertex in Resonite.
+
+    For some reason, this code currently seems to create more unique vertices than the mesh would have if exported as a .glb file.
+    In my test example, an avatar I converted had ~500 extra vertices compared to the .glb export. I'm not quite sure where those
+    extra vertices are coming from. This should still be investigated and improved.
 
     """
     if bone_infos and not all([ type(info) == BoneInfo for info in bone_infos ]):
@@ -222,9 +228,9 @@ def _create_mesh_import_message(
 
     # Remove all duplicate entries from the loop data array
     unique_loop_data, unique_loop_indices, unique_loop_inverse_mapping = np.unique(loop_data, axis=0, return_index=True, return_inverse=True)
+    unique_loop_indices = unique_loop_indices.astype(np.int32) # int64 -> int32
     unique_loop_inverse_mapping = unique_loop_inverse_mapping.astype(np.int32) # int64 -> int32
     unique_loop_vertex_mapping = loop_vertex_mapping[unique_loop_indices]
-
     unique_loop_count = len(unique_loop_data)
     offset = 0
 

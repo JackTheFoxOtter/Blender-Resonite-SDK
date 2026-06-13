@@ -38,6 +38,7 @@ import threading
 import logging
 import asyncio
 import bmesh
+import time
 import bpy
 
 
@@ -156,8 +157,9 @@ def _create_mesh_import_message(
     if uv_layer_indices is not None and not ( 1 <= len(uv_layer_indices) <= 4 and all([ type(uv) == int and 0 <= uv < len(mesh.uv_layers) for uv in uv_layer_indices ]) ):
         raise ValueError("Attribute 'uv_layer_indices' must be a list of 1 to 4 integers where each value is a valid uv layer index of the mesh.")
 
+    t_start = time.time()
     msg_import_mesh = ImportMeshRawData()
-    
+
     mesh.calc_loop_triangles()
     mesh.calc_tangents()
     mesh.calc_smooth_groups()
@@ -336,6 +338,9 @@ def _create_mesh_import_message(
         triangle_submesh._indices = submesh_triangle_indices.tobytes()
         msg_import_mesh.submeshes.append(triangle_submesh)
     
+    t_end = time.time()
+    logging.info(f"Created ResoniteLink ImportMeshRawData message for mesh '{mesh.name}' in {t_end - t_start}s")
+    
     return msg_import_mesh
 
 
@@ -387,22 +392,43 @@ def _quaternion_to_floatQ(quat : Quaternion) -> FloatQ:
 
 
 async def _import_armature_hierarchy(client : ResoniteLinkClient, root_slot : Union[Slot, SlotProxy], armature : bpy.types.Armature) -> List[BoneInfo]:
+    """
+    Imports an armature as a slot hierarchy into Resonite.
+    Returns a list of all bone infos, including mapping and bone pose matrix.
+
+    """
     bone_infos : List[BoneInfo] = []
     root_bone = _find_root_bone(armature)
 
+    # NOTE: Potentially the matrix stuff can be improved. I have however already put a significant amount ot work into it,
+    #       and it seems to work correctly, so I've decided to not touch it again for the time being.
+    
+    space_correction = Matrix ((
+        (-1.0,  0.0,  0.0,  0.0), 
+        ( 0.0,  0.0,  1.0,  0.0), 
+        ( 0.0, -1.0,  0.0,  0.0),
+        ( 0.0,  0.0,  0.0,  1.0)
+    ))
+    
+    space_correction_2 = Matrix((
+        ( 1.0,  0.0,  0.0,  0.0), 
+        ( 0.0,  0.0,  1.0,  0.0), 
+        ( 0.0, -1.0,  0.0,  0.0),
+        ( 0.0,  0.0,  0.0,  1.0)
+    ))
+    
+    inv_x = Matrix((
+        (-1.0,  0.0,  0.0,  0.0), 
+        ( 0.0,  1.0,  0.0,  0.0), 
+        ( 0.0,  0.0,  1.0,  0.0),
+        ( 0.0,  0.0,  0.0,  1.0)
+    ))
+
     async def _build_armature_recursive(parent_slot : Union[Slot, SlotProxy], bone : bpy.types.Bone):
-        props : BLENDER_RESONITE_SDK_Properties = bpy.context.scene.blender_resonite_sdk # type: ignore
-        
-        space_correction : Matrix = props.coordinate_conversion_matrix.transposed() # Transposed because Blender's UI mixes up rows / columns
-        space_correction_2 : Matrix = props.coordinate_conversion_matrix_2.transposed() # Transposed because Blender's UI mixes up rows / columns
-        
-        inv_x = Matrix(( # TODO: To constant somewhere.
-            (-1.0, 0.0,  0.0, 0.0), 
-            (0.0,  1.0,  0.0, 0.0), 
-            (0.0,  0.0,  1.0, 0.0),
-            (0.0,  0.0,  0.0, 1.0)
-        ))
-        
+        """
+        Recursively walks the armature and imports each bone as a Slot underneath the armature root slot.
+
+        """
         mat : Matrix
         if not bone.parent:
             # Root bone
@@ -512,6 +538,7 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
                         color_attribute_index=self._mesh.color_attributes.active_color_index if self._mesh.color_attributes.active_color_index is not None and self._mesh.color_attributes.active_color_index > 0 else None, # TODO: Setting 
                         uv_layer_indices=[ self._mesh.uv_layers.active_index ] if self._mesh.uv_layers.active_index is not None else [ ] # TODO: Setting
                     )
+
                     mesh_asset : AssetData = await client.send_message(msg_import_mesh) # type: ignore
 
                     # Adds a StaticMesh component to the slot and assigns the asset URI of the imported mesh data. 
@@ -612,29 +639,7 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
 
 
 class BLENDER_RESONITE_SDK_Properties(bpy.types.PropertyGroup):
-    coordinate_conversion_matrix : bpy.props.FloatVectorProperty(
-        name="Coordinate Conversion", 
-        size=(4, 4),
-        subtype='MATRIX',
-        default=(
-            (-1.0,  0.0,  0.0,  0.0), 
-            ( 0.0,  0.0,  1.0,  0.0), 
-            ( 0.0, -1.0,  0.0,  0.0),
-            ( 0.0,  0.0,  0.0,  1.0)
-        )
-    ) # type: ignore
-
-    coordinate_conversion_matrix_2 : bpy.props.FloatVectorProperty(
-        name="Coordinate Conversion", 
-        size=(4, 4),
-        subtype='MATRIX',
-        default=(
-            ( 1.0,  0.0,  0.0,  0.0), 
-            ( 0.0,  0.0,  1.0,  0.0), 
-            ( 0.0, -1.0,  0.0,  0.0),
-            ( 0.0,  0.0,  0.0,  1.0)
-        )
-    ) # type: ignore
+    pass
 
 
 class BLENDER_RESONITE_SDK_PT_test_panel(bpy.types.Panel):
@@ -652,8 +657,6 @@ class BLENDER_RESONITE_SDK_PT_test_panel(bpy.types.Panel):
         props : BLENDER_RESONITE_SDK_Properties = bpy.context.scene.blender_resonite_sdk # type: ignore
         
         self.layout.operator("blender_resonite_sdk.send_active_object", text="Send Active Object")
-        self.layout.prop(props, 'coordinate_conversion_matrix')
-        self.layout.prop(props, 'coordinate_conversion_matrix_2')
         # self.layout.operator("blender_resonite_sdk.send_active_object_evaluated", text="Apply Modifiers & Send Active Object")
 
 

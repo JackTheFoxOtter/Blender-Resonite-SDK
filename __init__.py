@@ -32,6 +32,7 @@ from resonitelink import \
     Field_Uri, Field_Enum, Field_Float, Reference, SyncList
 from mathutils import Matrix, Vector, Quaternion, Euler
 from typing import Set, Optional, Union, List, Sequence
+from numpy.typing import NDArray
 import numpy as np
 import threading
 import logging
@@ -98,11 +99,8 @@ def _remap_blender_to_resonite(arr : np.ndarray):
     Transformation: `X, Y, Z` -> `-X, Z, -Y`
 
     """
-    # arr = arr.reshape(-1, 3) # Reshape to 2D Array
-    # arr = arr[:, [0, 2, 1]] # Swizzle columns (X, Y, Z) -> (X, Z, Y)
-    # arr = np.multiply(arr, np.array([-1, 1, -1], dtype=arr.dtype)) # Invert X & Y
-    # return arr.ravel()
-    arr[0::3], arr[1::3], arr[2::3] = -arr[0::3], arr[2::3], -arr[1::3] # Faster transformation (X, Y, Z) -> (-X, Z, -Y)
+    arr[0::3], arr[1::3], arr[2::3] = -arr[0::3], arr[2::3], -arr[1::3] # Transformation (X, Y, Z) -> (-X, Z, -Y)
+
 
 def _reverse_column_order(arr : np.ndarray):
     """
@@ -110,8 +108,7 @@ def _reverse_column_order(arr : np.ndarray):
     Transformation: `X, Y, Z` -> `Z, Y, X`
 
     """
-    # return arr = arr.reshape(-1, 3)[:, [2, 1, 0]].ravel() # Reverse order (X, Y, Z) -> (Z, Y, X)
-    arr[0::3], arr[2::3] = arr[2::3], arr[0::3].copy() # Faster transformation (X, Y, Z) -> (Z, Y, X)
+    arr[0::3], arr[2::3] = arr[2::3], arr[0::3].copy() # Transformation (X, Y, Z) -> (Z, Y, X)
 
 
 class BoneInfo():
@@ -131,7 +128,13 @@ class BoneInfo():
         self._slot = slot
 
 
-def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[List[BoneInfo]]) -> ImportMeshRawData:
+def _create_mesh_import_message(
+    mesh : bpy.types.Mesh, 
+    bone_infos : Optional[List[BoneInfo]] = None,
+    bone_weight_count : int = 4,
+    color_attribute_index : Optional[int] = None,
+    uv_layer_indices : Optional[List[int]] = None,
+) -> ImportMeshRawData:
     """
     Creates a ImportMeshRawData message from the provided Blender mesh.
 
@@ -141,63 +144,123 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
     To ensure we get all the correct face data (shading, UVs etc.), we need to import each loop as a separate vertex into Resonite.
 
     """
+    if bone_infos and not all([ type(info) == BoneInfo for info in bone_infos ]):
+        raise ValueError("Attribute 'bone_infos' must be a list of BoneInfo instances.")
+    
+    if not ( type(bone_weight_count) == int and 1 <= bone_weight_count <= 4 ):
+        raise ValueError("Attribute 'bone_weight_count' must be an integer between 1 and 4.")
+    
+    if color_attribute_index is not None and not ( type(color_attribute_index) == int and 0 <= color_attribute_index < len(mesh.color_attributes)):
+        raise ValueError("Attribute 'color_attribute_index' must be an integer and a valid color attribute index of the mesh.")
+    
+    if uv_layer_indices is not None and not ( 1 <= len(uv_layer_indices) <= 4 and all([ type(uv) == int and 0 <= uv < len(mesh.uv_layers) for uv in uv_layer_indices ]) ):
+        raise ValueError("Attribute 'uv_layer_indices' must be a list of 1 to 4 integers where each value is a valid uv layer index of the mesh.")
+
+    msg_import_mesh = ImportMeshRawData()
+    
     mesh.calc_loop_triangles()
     mesh.calc_tangents()
+    mesh.calc_smooth_groups()
 
     vertex_count = len(mesh.vertices)
     loop_count = len(mesh.loops)
     triangle_count = len(mesh.loop_triangles)
-    
-    # TODO: Right now each loop vertex is imported as a separate vertex. This results in doubles in the final mesh!
-    #       What needs to happen is that we put all required vertex data all loops into one big array, and then call np.unique() to remove all doubles.
 
-    # Mapping to get the vertex index for each loop index
+    # Mapping loop index -> vertex index
     loop_vertex_mapping = np.empty(loop_count, dtype=np.int32)
     mesh.loops.foreach_get('vertex_index', loop_vertex_mapping)
     
-    msg_import_mesh = ImportMeshRawData()
+    # NOTE: I attempted to directly write the data from Blender into views of loop_data, but couldn't figure out a view to do that
+    #       without numpy creating a copy of the array, sort of missing the point. This might still be possible as an optimization,
+    #       I just couldn't figure it out myself.
 
-    # Convert vertex positions
+    loop_data_segments : List[NDArray] = []
+
+    # Loop positions from referenced vertices
     vertex_positions = np.empty(vertex_count*3, dtype=np.float32)
     mesh.vertices.foreach_get('co', vertex_positions)
-    loop_positions = vertex_positions.reshape(-1, 3)[loop_vertex_mapping].ravel()
-    _remap_blender_to_resonite(loop_positions)
-    msg_import_mesh.vertex_count = loop_count
-    msg_import_mesh._positions = loop_positions.tobytes()
+    _remap_blender_to_resonite(vertex_positions)
+    loop_data_segments.append(vertex_positions.reshape(-1, 3, copy=False)[loop_vertex_mapping])
 
-    # Convert vertex normals
-    normals = np.empty(loop_count*3, dtype=np.float32)
-    mesh.loops.foreach_get('normal', normals)
-    _remap_blender_to_resonite(normals)
+    # Loop normals
+    loop_normals = np.empty(loop_count*3, dtype=np.float32)
+    mesh.loops.foreach_get('normal', loop_normals)
+    _remap_blender_to_resonite(loop_normals)
+    loop_data_segments.append(loop_normals.reshape(-1, 3, copy=False))
+
+    # Loop tangents
+    loop_tangents = np.empty(loop_count*3, dtype=np.float32)
+    mesh.loops.foreach_get('tangent', loop_tangents)
+    _remap_blender_to_resonite(loop_tangents)
+    loop_data_segments.append(loop_tangents.reshape(-1, 3, copy=False))
+
+    # Loop bitangent signs
+    loop_bitangent_signs = np.empty(loop_count, dtype=np.float32)
+    mesh.loops.foreach_get('bitangent_sign', loop_bitangent_signs)
+    loop_data_segments.append(loop_bitangent_signs.reshape(-1, 1, copy=False))
+
+    if color_attribute_index is not None:
+        # Loop colors
+        loop_colors = np.empty(loop_count*4, dtype=np.float32)
+        color_attribute : Union[bpy.types.FloatColorAttribute, bpy.types.ByteColorAttribute] = mesh.color_attributes[color_attribute_index] # type: ignore
+        color_attribute.data.foreach_get('color', loop_colors)
+        loop_data_segments.append(loop_colors.reshape(-1, 4, copy=False))
+    
+    if uv_layer_indices is not None:
+        # Loop UVs
+        for uv_layer_index in range(len(uv_layer_indices)):
+            loop_uvs = np.empty(loop_count*2, dtype=np.float32)
+            uv_layer : bpy.types.MeshUVLoopLayer = mesh.uv_layers[uv_layer_index]
+            uv_layer.data.foreach_get('uv', loop_uvs)
+            loop_uvs = np.round(loop_uvs, 4)
+            loop_data_segments.append(loop_uvs.reshape(-1, 2, copy=False))
+    
+    # Combine all loop data into one big 2d array
+    loop_data = np.hstack(loop_data_segments)
+
+    # Remove all duplicate entries from the loop data array
+    unique_loop_data, unique_loop_indices, unique_loop_inverse_mapping = np.unique(loop_data, axis=0, return_index=True, return_inverse=True)
+    unique_loop_inverse_mapping = unique_loop_inverse_mapping.astype(np.int32) # int64 -> int32
+    unique_loop_vertex_mapping = loop_vertex_mapping[unique_loop_indices]
+
+    unique_loop_count = len(unique_loop_data)
+    offset = 0
+
+    # Write Resonite vertex positions
+    unique_loop_positions = unique_loop_data[:, offset:offset+3]
+    msg_import_mesh.vertex_count = unique_loop_count
+    msg_import_mesh._positions = unique_loop_positions.tobytes()
+    offset += 3
+
+    # Write Resonite vertex normals
+    unique_loop_normals = unique_loop_data[:, offset:offset+3]
     msg_import_mesh.has_normals = True
-    msg_import_mesh._normals = normals.tobytes()
+    msg_import_mesh._normals = unique_loop_normals.tobytes()
+    offset += 3
 
-    # Convert vertex tangents & bitangent signs
-    tangents = np.empty(loop_count*3, dtype=np.float32)
-    mesh.loops.foreach_get('tangent', tangents)
-    bitangent_signs = np.empty(loop_count, dtype=np.float32)
-    mesh.loops.foreach_get('bitangent_sign', bitangent_signs)
-    tangents_and_bitangent_signs = np.concatenate((tangents.reshape(-1, 3), bitangent_signs.reshape(-1, 1)), axis=1)
+    # Write Resonite vertex tangents & bitangent signs
+    unique_loop_tangents_and_bitangent_signs = unique_loop_data[:, offset:offset+4]
     msg_import_mesh.has_tangents = True
-    msg_import_mesh._tangents = tangents_and_bitangent_signs.ravel().tobytes()
+    msg_import_mesh._tangents = unique_loop_tangents_and_bitangent_signs.tobytes()
+    offset += 4
 
-    # Convert vertex colors
-    if mesh.vertex_colors.active:
-        vertex_colors = np.empty(loop_count*4, dtype=np.float32)
-        mesh.vertex_colors.active.data.foreach_get('color', vertex_colors)
+    if color_attribute_index is not None:
+        # Write Resonite vertex colors
+        unique_loop_colors = unique_loop_data[:, offset:offset+4]
         msg_import_mesh.has_colors = True
-        msg_import_mesh._colors = vertex_colors.tobytes()
+        msg_import_mesh._colors = unique_loop_colors.tobytes()
+        offset += 4
     
-    # Convert UVs
-    # TODO: Resonite supports up to 4 UV layers, so we should have options to define which ones we import.
-    #       For now, we only import the active one.
-    if mesh.uv_layers.active:
-        uv_coords = np.empty(loop_count*2, dtype=np.float32)
-        mesh.uv_layers.active.uv.foreach_get('vector', uv_coords)
-        msg_import_mesh.uv_channel_dimensions = [ 2 ]
-        msg_import_mesh._uvs = [ uv_coords.tobytes() ]
+    if uv_layer_indices is not None:
+        # Write Resonite UVs
+        msg_import_mesh.uv_channel_dimensions = [ 2 ] * len(uv_layer_indices)
+        msg_import_mesh._uvs = [ ]
+        for uv_layer_index in range(len(uv_layer_indices)):
+            unique_uvs = unique_loop_data[:, offset:offset+2]
+            msg_import_mesh._uvs.append(unique_uvs.tobytes())
+            offset += 2
     
-    # Convert shape keys
+    # Write Resonite blendshapes
     if mesh.shape_keys:
         msg_import_mesh.blendshapes = []
         for shape_key_name, shape_key in mesh.shape_keys.key_blocks.items():
@@ -205,12 +268,15 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
                 # Skip basis key
                 continue
             
-            # Blender doesn't support multi-frame shape keys, only ever one frame
+            # Vertex positions for shape keys
+            # NOTE: Blender doesn't support multi-frame shape keys, only ever one frame
             blendshape_frame_vertex_positions = np.empty(vertex_count*3, dtype=np.float32)
             shape_key.data.foreach_get('co', blendshape_frame_vertex_positions)
-            blendshape_frame_loop_positions = blendshape_frame_vertex_positions.reshape(-1, 3)[loop_vertex_mapping].ravel()
-            _remap_blender_to_resonite(blendshape_frame_loop_positions)
-            blendshape_frame_loop_position_deltas = np.subtract(blendshape_frame_loop_positions, loop_positions)
+            _remap_blender_to_resonite(blendshape_frame_vertex_positions)
+            blendshape_frame_loop_positions = blendshape_frame_vertex_positions.reshape(-1, 3)[unique_loop_vertex_mapping]
+            
+            # Write Resonite blendshape frames
+            blendshape_frame_loop_position_deltas = np.subtract(blendshape_frame_loop_positions, unique_loop_positions)
             blendshape_frame = BlendshapeFrameRawData(position=1.0)
             blendshape_frame._position_deltas = blendshape_frame_loop_position_deltas.tobytes()
             msg_import_mesh.blendshapes.append(BlendshapeRawData(
@@ -220,12 +286,11 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
                 frames=[ blendshape_frame ]
             ))
     
-    # Convert bones (armature) & bone weights
+    # Write Resonite bones (armature) & bone weights
     if bone_infos:
-        bone_weight_count = 4 # TODO: Expose as setting # Max amount of bones that can influence a single vertex. Max Resonite supports is 4
-        
-        # Blender stores bone influences per vertex as links to vertex groups associated with a weight value.
-        # Unfortunately, there doesn't seem to be a faster way to access that information.
+        # Vertex influences for bones
+        # NOTE: Blender stores bone influences per vertex as links to vertex groups associated with a weight value.
+        #       Unfortunately, there doesn't seem to be a faster way to access that information.
         vertex_influences = np.empty(vertex_count * bone_weight_count, dtype=[("group", np.int32), ("weight", np.float32)])
         for vert_index, vert in enumerate(mesh.vertices):
             group_index : int = 0
@@ -243,28 +308,32 @@ def _create_mesh_import_message(mesh : bpy.types.Mesh, bone_infos : Optional[Lis
                 vertex_influences[vert_index * bone_weight_count + group_index][0] = -1
                 vertex_influences[vert_index * bone_weight_count + group_index][1] = 0.0
         
-        loop_influences = vertex_influences.reshape(-1, bone_weight_count)[loop_vertex_mapping]
+        loop_influences = vertex_influences.reshape(-1, bone_weight_count)[unique_loop_vertex_mapping]
+        
+        # Write Resonite bone weights
         msg_import_mesh.bones = [ bone_info.bone for bone_info in bone_infos ]
         msg_import_mesh.bone_weight_count = bone_weight_count
-        msg_import_mesh._bone_weights = loop_influences.ravel().tobytes()
+        msg_import_mesh._bone_weights = loop_influences.tobytes()
 
-    # Convert triangles
-    msg_import_mesh.submeshes = []
-    triangle_indices = np.empty(triangle_count*3, dtype=np.int32)
-    mesh.loop_triangles.foreach_get('loops', triangle_indices)
-    _reverse_column_order(triangle_indices) # Reverse winding
-    material_indices = np.empty(triangle_count, dtype=np.int32)
-    mesh.loop_triangles.foreach_get('material_index', material_indices)
-    triangle_and_material_indices = np.concatenate((triangle_indices.reshape(-1, 3), material_indices.reshape(-1, 1)), axis=1)
+    # Loop triangles & triangle material indices
+    loop_triangle_indices = np.empty(triangle_count*3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get('loops', loop_triangle_indices)
+    unique_loop_triangle_indices = unique_loop_inverse_mapping[loop_triangle_indices]
+    _reverse_column_order(unique_loop_triangle_indices) # Reverse winding
+    loop_material_indices = np.empty(triangle_count, dtype=np.int32)
+    mesh.loop_triangles.foreach_get('material_index', loop_material_indices)
+    triangle_and_material_indices = np.hstack([ unique_loop_triangle_indices.reshape(-1, 3), loop_material_indices.reshape(-1, 1) ])
     
-    # Split submeshes by material index
-    material_count = np.max(material_indices) + 1
+    # Write Resonite submeshes
+    # NOTE: Resonite uses one submesh per material index
+    msg_import_mesh.submeshes = []
+    material_count = np.max(loop_material_indices) + 1
     for material_index in range(material_count):
         submesh_mask = triangle_and_material_indices[:, 3] == material_index # Boolean mask for material index
-        submesh_triangle_indices =  triangle_and_material_indices[submesh_mask, :3] # Don't include material index column
+        submesh_triangle_indices = triangle_and_material_indices[submesh_mask, :3] # Don't include material index column
         triangle_submesh = TriangleSubmeshRawData()
         triangle_submesh.triangle_count = len(submesh_triangle_indices)
-        triangle_submesh._indices = submesh_triangle_indices.ravel().tobytes()
+        triangle_submesh._indices = submesh_triangle_indices.tobytes()
         msg_import_mesh.submeshes.append(triangle_submesh)
     
     return msg_import_mesh
@@ -436,7 +505,13 @@ class BLENDER_RESONITE_SDK_OT_send_active_object(AsyncOperator):
                     mesh_root_slot = await client.add_slot(name=self._object.name, parent=object_root_slot)
 
                     # Import mesh data
-                    msg_import_mesh = _create_mesh_import_message(self._mesh, self._bone_infos)
+                    msg_import_mesh = _create_mesh_import_message(
+                        self._mesh, 
+                        self._bone_infos, 
+                        bone_weight_count=4, # TODO: Setting
+                        color_attribute_index=self._mesh.color_attributes.active_color_index if self._mesh.color_attributes.active_color_index is not None and self._mesh.color_attributes.active_color_index > 0 else None, # TODO: Setting 
+                        uv_layer_indices=[ self._mesh.uv_layers.active_index ] if self._mesh.uv_layers.active_index is not None else [ ] # TODO: Setting
+                    )
                     mesh_asset : AssetData = await client.send_message(msg_import_mesh) # type: ignore
 
                     # Adds a StaticMesh component to the slot and assigns the asset URI of the imported mesh data. 
